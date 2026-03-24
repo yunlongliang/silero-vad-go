@@ -1,0 +1,11 @@
+# Build artifacts
+examples/examples
+*.exe
+*.test
+*.out
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo

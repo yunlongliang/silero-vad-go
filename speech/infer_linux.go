@@ -12,16 +12,13 @@ import (
 	"unsafe"
 )
 
-func (sd *Detector) Infer(samples []float32) (float32, error) {
+func (sd *Detector) infer(samples []float32) (float32, error) {
 	pcm := samples
 	if sd.currSample > 0 {
-		// Append context from previous iteration.
 		pcm = append(sd.ctx[:], samples...)
 	}
-	// Save the last contextLen samples as context for the next iteration.
 	copy(sd.ctx[:], samples[len(samples)-contextLen:])
 
-	// Create tensors
 	var pcmValue *C.OrtValue
 	pcmInputDims := []C.long{
 		1,
@@ -53,7 +50,6 @@ func (sd *Detector) Infer(samples []float32) (float32, error) {
 	}
 	defer C.OrtApiReleaseValue(sd.api, rateValue)
 
-	// Run inference
 	inputs := []*C.OrtValue{pcmValue, stateValue, rateValue}
 	outputs := []*C.OrtValue{nil, nil}
 
@@ -72,7 +68,6 @@ func (sd *Detector) Infer(samples []float32) (float32, error) {
 		return 0, fmt.Errorf("failed to run: %s", C.GoString(C.OrtApiGetErrorMessage(sd.api, status)))
 	}
 
-	// Get output values from tensor data
 	var prob unsafe.Pointer
 	var stateN unsafe.Pointer
 
@@ -93,6 +88,5 @@ func (sd *Detector) Infer(samples []float32) (float32, error) {
 	C.OrtApiReleaseValue(sd.api, outputs[0])
 	C.OrtApiReleaseValue(sd.api, outputs[1])
 
-	// Return speech probability
 	return *(*float32)(prob), nil
 }
