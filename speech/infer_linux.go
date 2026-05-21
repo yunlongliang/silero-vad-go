@@ -14,10 +14,14 @@ import (
 
 func (sd *Detector) infer(samples []float32) (float32, error) {
 	pcm := samples
-	if sd.currSample > 0 {
-		pcm = append(sd.ctx[:], samples...)
+
+	// v3/sherpa model uses LSTM state for temporal context; v5 prepends explicit context samples
+	if !sd.separateHC {
+		if sd.currSample > 0 {
+			pcm = append(sd.ctx[:], samples...)
+		}
+		copy(sd.ctx[:], samples[len(samples)-contextLen:])
 	}
-	copy(sd.ctx[:], samples[len(samples)-contextLen:])
 
 	var pcmValue *C.OrtValue
 	pcmInputDims := []C.long{
