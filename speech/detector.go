@@ -247,7 +247,7 @@ func NewDetector(cfg DetectorConfig) (*Detector, error) {
 		return nil, fmt.Errorf("failed to set inter threads: %s", C.GoString(C.OrtApiGetErrorMessage(sd.api, status)))
 	}
 
-	status = C.OrtApiSetSessionGraphOptimizationLevel(sd.api, sd.sessionOpts, C.ORT_DISABLE_ALL)
+	status = C.OrtApiSetSessionGraphOptimizationLevel(sd.api, sd.sessionOpts, C.ORT_ENABLE_ALL)
 	defer C.OrtApiReleaseStatus(sd.api, status)
 	if status != nil {
 		return nil, fmt.Errorf("failed to set session graph optimization level: %s", C.GoString(C.OrtApiGetErrorMessage(sd.api, status)))
