@@ -31,3 +31,10 @@ OrtStatus* OrtApiRun(OrtApi* api, OrtSession* session, const OrtRunOptions* run_
     const char* const* output_names, size_t output_names_len, OrtValue** outputs);
 
 OrtStatus* OrtApiGetTensorMutableData(OrtApi* api, OrtValue* value, void** data);
+
+OrtStatus* OrtApiSessionGetInputCount(OrtApi* api, const OrtSession* session, size_t* out);
+OrtStatus* OrtApiSessionGetOutputCount(OrtApi* api, const OrtSession* session, size_t* out);
+OrtStatus* OrtApiSessionGetInputName(OrtApi* api, const OrtSession* session, size_t index, OrtAllocator* allocator, char** value);
+OrtStatus* OrtApiSessionGetOutputName(OrtApi* api, const OrtSession* session, size_t index, OrtAllocator* allocator, char** value);
+OrtStatus* OrtApiGetAllocatorWithDefaultOptions(OrtApi* api, OrtAllocator** out);
+OrtStatus* OrtApiAllocatorFree(OrtApi* api, OrtAllocator* allocator, void* p);

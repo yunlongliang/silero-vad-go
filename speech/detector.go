@@ -108,6 +108,9 @@ type Detector struct {
 	memoryInfo  *C.OrtMemoryInfo
 	cStrings    map[string]*C.char
 
+	inputNames  []*C.char
+	outputNames []*C.char
+
 	cfg DetectorConfig
 
 	state [stateLen]float32
@@ -129,6 +132,78 @@ type Segment struct {
 	SpeechStartAt int
 	// The relative timestamp in milliseconds of when a speech segment ends.
 	SpeechEndAt int
+}
+
+// querySessionNames queries the actual input/output tensor names from the ONNX
+// session, so we don't rely on hard-coded names that may differ across
+// onnxruntime builds or model versions.
+func (sd *Detector) querySessionNames() error {
+	var allocator *C.OrtAllocator
+	status := C.OrtApiGetAllocatorWithDefaultOptions(sd.api, &allocator)
+	if status != nil {
+		msg := C.GoString(C.OrtApiGetErrorMessage(sd.api, status))
+		C.OrtApiReleaseStatus(sd.api, status)
+		return fmt.Errorf("failed to get allocator: %s", msg)
+	}
+
+	var inputCount, outputCount C.size_t
+	status = C.OrtApiSessionGetInputCount(sd.api, sd.session, &inputCount)
+	if status != nil {
+		msg := C.GoString(C.OrtApiGetErrorMessage(sd.api, status))
+		C.OrtApiReleaseStatus(sd.api, status)
+		return fmt.Errorf("failed to get input count: %s", msg)
+	}
+	status = C.OrtApiSessionGetOutputCount(sd.api, sd.session, &outputCount)
+	if status != nil {
+		msg := C.GoString(C.OrtApiGetErrorMessage(sd.api, status))
+		C.OrtApiReleaseStatus(sd.api, status)
+		return fmt.Errorf("failed to get output count: %s", msg)
+	}
+
+	slog.Info("silero-vad ONNX session",
+		slog.Int("inputCount", int(inputCount)),
+		slog.Int("outputCount", int(outputCount)),
+		slog.String("model", sd.cfg.ModelPath))
+
+	sd.inputNames = make([]*C.char, int(inputCount))
+	for i := 0; i < int(inputCount); i++ {
+		var name *C.char
+		status = C.OrtApiSessionGetInputName(sd.api, sd.session, C.size_t(i), allocator, &name)
+		if status != nil {
+			msg := C.GoString(C.OrtApiGetErrorMessage(sd.api, status))
+			C.OrtApiReleaseStatus(sd.api, status)
+			return fmt.Errorf("failed to get input name %d: %s", i, msg)
+		}
+		goName := C.GoString(name)
+		status = C.OrtApiAllocatorFree(sd.api, allocator, unsafe.Pointer(name))
+		if status != nil {
+			C.OrtApiReleaseStatus(sd.api, status)
+		}
+		sd.cStrings[fmt.Sprintf("_input_%d", i)] = C.CString(goName)
+		sd.inputNames[i] = sd.cStrings[fmt.Sprintf("_input_%d", i)]
+		slog.Info("silero-vad input", slog.Int("index", i), slog.String("name", goName))
+	}
+
+	sd.outputNames = make([]*C.char, int(outputCount))
+	for i := 0; i < int(outputCount); i++ {
+		var name *C.char
+		status = C.OrtApiSessionGetOutputName(sd.api, sd.session, C.size_t(i), allocator, &name)
+		if status != nil {
+			msg := C.GoString(C.OrtApiGetErrorMessage(sd.api, status))
+			C.OrtApiReleaseStatus(sd.api, status)
+			return fmt.Errorf("failed to get output name %d: %s", i, msg)
+		}
+		goName := C.GoString(name)
+		status = C.OrtApiAllocatorFree(sd.api, allocator, unsafe.Pointer(name))
+		if status != nil {
+			C.OrtApiReleaseStatus(sd.api, status)
+		}
+		sd.cStrings[fmt.Sprintf("_output_%d", i)] = C.CString(goName)
+		sd.outputNames[i] = sd.cStrings[fmt.Sprintf("_output_%d", i)]
+		slog.Info("silero-vad output", slog.Int("index", i), slog.String("name", goName))
+	}
+
+	return nil
 }
 
 // NewDetector creates a new speech detector with the given configuration.
@@ -172,7 +247,7 @@ func NewDetector(cfg DetectorConfig) (*Detector, error) {
 		return nil, fmt.Errorf("failed to set inter threads: %s", C.GoString(C.OrtApiGetErrorMessage(sd.api, status)))
 	}
 
-	status = C.OrtApiSetSessionGraphOptimizationLevel(sd.api, sd.sessionOpts, C.ORT_ENABLE_ALL)
+	status = C.OrtApiSetSessionGraphOptimizationLevel(sd.api, sd.sessionOpts, C.ORT_DISABLE_ALL)
 	defer C.OrtApiReleaseStatus(sd.api, status)
 	if status != nil {
 		return nil, fmt.Errorf("failed to set session graph optimization level: %s", C.GoString(C.OrtApiGetErrorMessage(sd.api, status)))
@@ -191,11 +266,16 @@ func NewDetector(cfg DetectorConfig) (*Detector, error) {
 		return nil, fmt.Errorf("failed to create memory info: %s", C.GoString(C.OrtApiGetErrorMessage(sd.api, status)))
 	}
 
-	sd.cStrings["input"] = C.CString("input")
-	sd.cStrings["sr"] = C.CString("sr")
-	sd.cStrings["state"] = C.CString("state")
-	sd.cStrings["stateN"] = C.CString("stateN")
-	sd.cStrings["output"] = C.CString("output")
+	if err := sd.querySessionNames(); err != nil {
+		return nil, fmt.Errorf("failed to query session names: %w", err)
+	}
+
+	if len(sd.inputNames) < 3 {
+		return nil, fmt.Errorf("expected at least 3 inputs, got %d", len(sd.inputNames))
+	}
+	if len(sd.outputNames) < 2 {
+		return nil, fmt.Errorf("expected at least 2 outputs, got %d", len(sd.outputNames))
+	}
 
 	return &sd, nil
 }

@@ -53,16 +53,7 @@ func (sd *Detector) infer(samples []float32) (float32, error) {
 	inputs := []*C.OrtValue{pcmValue, stateValue, rateValue}
 	outputs := []*C.OrtValue{nil, nil}
 
-	inputNames := []*C.char{
-		sd.cStrings["input"],
-		sd.cStrings["state"],
-		sd.cStrings["sr"],
-	}
-	outputNames := []*C.char{
-		sd.cStrings["output"],
-		sd.cStrings["stateN"],
-	}
-	status = C.OrtApiRun(sd.api, sd.session, nil, &inputNames[0], &inputs[0], C.size_t(len(inputNames)), &outputNames[0], C.size_t(len(outputNames)), &outputs[0])
+	status = C.OrtApiRun(sd.api, sd.session, nil, &sd.inputNames[0], &inputs[0], C.size_t(len(sd.inputNames)), &sd.outputNames[0], C.size_t(len(sd.outputNames)), &outputs[0])
 	defer C.OrtApiReleaseStatus(sd.api, status)
 	if status != nil {
 		return 0, fmt.Errorf("failed to run: %s", C.GoString(C.OrtApiGetErrorMessage(sd.api, status)))

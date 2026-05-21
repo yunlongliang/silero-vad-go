@@ -80,3 +80,27 @@ OrtStatus* OrtApiRun(OrtApi* api, OrtSession* session, const OrtRunOptions* run_
 OrtStatus* OrtApiGetTensorMutableData(OrtApi* api, OrtValue* value, void** data) {
   return api->GetTensorMutableData(value, data);
 }
+
+OrtStatus* OrtApiSessionGetInputCount(OrtApi* api, const OrtSession* session, size_t* out) {
+  return api->SessionGetInputCount(session, out);
+}
+
+OrtStatus* OrtApiSessionGetOutputCount(OrtApi* api, const OrtSession* session, size_t* out) {
+  return api->SessionGetOutputCount(session, out);
+}
+
+OrtStatus* OrtApiSessionGetInputName(OrtApi* api, const OrtSession* session, size_t index, OrtAllocator* allocator, char** value) {
+  return api->SessionGetInputName(session, index, allocator, value);
+}
+
+OrtStatus* OrtApiSessionGetOutputName(OrtApi* api, const OrtSession* session, size_t index, OrtAllocator* allocator, char** value) {
+  return api->SessionGetOutputName(session, index, allocator, value);
+}
+
+OrtStatus* OrtApiGetAllocatorWithDefaultOptions(OrtApi* api, OrtAllocator** out) {
+  return api->GetAllocatorWithDefaultOptions(out);
+}
+
+OrtStatus* OrtApiAllocatorFree(OrtApi* api, OrtAllocator* allocator, void* p) {
+  return api->AllocatorFree(allocator, p);
+}
