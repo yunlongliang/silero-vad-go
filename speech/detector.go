@@ -13,7 +13,8 @@ import (
 )
 
 const (
-	stateLen   = 2 * 1 * 128
+	stateV5Len = 2 * 1 * 128
+	stateV3Len = 2 * 1 * 64
 	contextLen = 64
 )
 
@@ -113,8 +114,16 @@ type Detector struct {
 
 	cfg DetectorConfig
 
-	state [stateLen]float32
-	ctx   [contextLen]float32
+	// v5 model: combined h+c state [2,1,128]
+	stateV5 [stateV5Len]float32
+	// v3/sherpa model: separate h [2,1,64] and c [2,1,64]
+	stateH [stateV3Len]float32
+	stateC [stateV3Len]float32
+
+	// true when model uses v3/sherpa format (separate h/c, no sr input)
+	separateHC bool
+
+	ctx [contextLen]float32
 
 	currSample  int
 	triggered   bool
@@ -276,6 +285,14 @@ func NewDetector(cfg DetectorConfig) (*Detector, error) {
 	if len(sd.outputNames) < 2 {
 		return nil, fmt.Errorf("expected at least 2 outputs, got %d", len(sd.outputNames))
 	}
+
+	// Auto-detect model format: 3 outputs = v3/sherpa (x,h,c -> output,hn,cn),
+	// 2 outputs = v5 (input,state,sr -> output,stateN)
+	sd.separateHC = len(sd.outputNames) >= 3
+	slog.Info("silero-vad model format",
+		slog.Bool("separateHC", sd.separateHC),
+		slog.Int("inputs", len(sd.inputNames)),
+		slog.Int("outputs", len(sd.outputNames)))
 
 	return &sd, nil
 }
@@ -479,8 +496,12 @@ func (sd *Detector) Reset() error {
 	sd.prevEnd = 0
 	sd.nextStart = 0
 	sd.residual = nil
-	for i := 0; i < stateLen; i++ {
-		sd.state[i] = 0
+	for i := 0; i < stateV5Len; i++ {
+		sd.stateV5[i] = 0
+	}
+	for i := 0; i < stateV3Len; i++ {
+		sd.stateH[i] = 0
+		sd.stateC[i] = 0
 	}
 	for i := 0; i < contextLen; i++ {
 		sd.ctx[i] = 0
