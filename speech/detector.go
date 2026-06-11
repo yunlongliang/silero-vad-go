@@ -13,10 +13,15 @@ import (
 )
 
 const (
-	stateV5Len = 2 * 1 * 128
-	stateV3Len = 2 * 1 * 64
-	contextLen = 64
+	stateV5Len    = 2 * 1 * 128
+	stateV3Len    = 2 * 1 * 64
+	maxContextLen = 64 // 16kHz uses 64, 8kHz uses 32
 )
+
+type possibleEnd struct {
+	pos    int
+	silDur int
+}
 
 type LogLevel int
 
@@ -123,14 +128,15 @@ type Detector struct {
 	// true when model uses v3/sherpa format (separate h/c, no sr input)
 	separateHC bool
 
-	ctx [contextLen]float32
+	ctx [maxContextLen]float32
 
-	currSample  int
-	triggered   bool
-	tempEnd     int
-	speechStart int
-	prevEnd     int
-	nextStart   int
+	currSample   int
+	triggered    bool
+	tempEnd      int
+	speechStart  int
+	prevEnd      int
+	nextStart    int
+	possibleEnds []possibleEnd
 
 	residual []float32
 }
@@ -317,6 +323,15 @@ func (sd *Detector) SetMaxSpeechDurationS(s float64) {
 	sd.cfg.MaxSpeechDurationS = s
 }
 
+// contextSize returns the number of context samples for the configured sample rate.
+// 16kHz -> 64 samples, 8kHz -> 32 samples, matching the official Python/C++ reference.
+func (sd *Detector) contextSize() int {
+	if sd.cfg.SampleRate == 8000 {
+		return 32
+	}
+	return 64
+}
+
 func (sd *Detector) sampleToMs(sample int) int {
 	v := sample * 1000 / sd.cfg.SampleRate
 	if v < 0 {
@@ -326,8 +341,9 @@ func (sd *Detector) sampleToMs(sample int) int {
 }
 
 // Detect runs speech detection on a batch of PCM audio samples and returns
-// the detected speech segments. The samples must be float32 mono audio
-// at the sample rate specified in the detector config.
+// the detected speech segments. The algorithm matches the official Python
+// get_speech_timestamps implementation: collect probabilities, segment with
+// hysteresis, then apply padding with overlap resolution.
 func (sd *Detector) Detect(pcm []float32) ([]Segment, error) {
 	if sd == nil {
 		return nil, fmt.Errorf("invalid nil detector")
@@ -349,6 +365,12 @@ func (sd *Detector) Detect(pcm []float32) ([]Segment, error) {
 	speechPadSamples := sd.cfg.SpeechPadMs * srPerMs
 	minSpeechSamples := sd.cfg.MinSpeechDurationMs * srPerMs
 	minSilenceSamplesAtMaxSpeech := 98 * srPerMs
+	audioLenSamples := len(pcm)
+
+	negThreshold := sd.cfg.Threshold - 0.15
+	if negThreshold < 0.01 {
+		negThreshold = 0.01
+	}
 
 	maxSpeechSamples := math.Inf(1)
 	if sd.cfg.MaxSpeechDurationS > 0 {
@@ -356,130 +378,154 @@ func (sd *Detector) Detect(pcm []float32) ([]Segment, error) {
 			float64(windowSize) - float64(2*speechPadSamples)
 	}
 
-	var segments []Segment
-
-	for i := 0; i+windowSize <= len(pcm); i += windowSize {
-		speechProb, err := sd.infer(pcm[i : i+windowSize])
+	// Phase 1: Collect speech probabilities (including zero-padded last partial window).
+	var speechProbs []float32
+	for i := 0; i < audioLenSamples; i += windowSize {
+		end := i + windowSize
+		var chunk []float32
+		if end > audioLenSamples {
+			padded := make([]float32, windowSize)
+			copy(padded, pcm[i:])
+			chunk = padded
+		} else {
+			chunk = pcm[i:end]
+		}
+		prob, err := sd.infer(chunk)
 		if err != nil {
 			return nil, fmt.Errorf("infer failed: %w", err)
 		}
+		speechProbs = append(speechProbs, prob)
+	}
 
-		sd.currSample += windowSize
+	// Phase 2: Hysteresis segmentation (matches Python get_speech_timestamps).
+	type rawSegment struct{ start, end int }
 
-		if speechProb >= sd.cfg.Threshold {
-			if sd.tempEnd != 0 {
-				sd.tempEnd = 0
-				if sd.nextStart < sd.prevEnd {
-					sd.nextStart = sd.currSample - windowSize
-				}
+	var (
+		triggered   bool
+		speechStart int
+		tempEnd     int
+		prevEnd     int
+		nextStart   int
+		posEnds     []possibleEnd
+		rawSegs     []rawSegment
+	)
+
+	for i, prob := range speechProbs {
+		curSample := windowSize * i
+
+		if prob >= sd.cfg.Threshold && tempEnd != 0 {
+			silDur := curSample - tempEnd
+			if silDur > minSilenceSamplesAtMaxSpeech {
+				posEnds = append(posEnds, possibleEnd{tempEnd, silDur})
 			}
-			if !sd.triggered {
-				sd.triggered = true
-				sd.speechStart = sd.currSample - windowSize
-				slog.Debug("speech start",
-					slog.Int("startAtMs", sd.sampleToMs(sd.speechStart-speechPadSamples)))
+			tempEnd = 0
+			if nextStart < prevEnd {
+				nextStart = curSample
 			}
+		}
+
+		if prob >= sd.cfg.Threshold && !triggered {
+			triggered = true
+			speechStart = curSample
 			continue
 		}
 
-		if sd.triggered && float64(sd.currSample-sd.speechStart) > maxSpeechSamples {
-			if sd.prevEnd > 0 {
-				endAt := sd.sampleToMs(sd.prevEnd + speechPadSamples)
-				startAt := sd.sampleToMs(sd.speechStart - speechPadSamples)
-				slog.Debug("speech end (max duration, split at prev_end)",
-					slog.Int("startAtMs", startAt), slog.Int("endAtMs", endAt))
-				segments = append(segments, Segment{
-					SpeechStartAt: startAt,
-					SpeechEndAt:   endAt,
-				})
-
-				if sd.nextStart < sd.prevEnd {
-					sd.triggered = false
-				} else {
-					sd.speechStart = sd.nextStart
+		if triggered && float64(curSample-speechStart) > maxSpeechSamples {
+			if len(posEnds) > 0 {
+				bestIdx := 0
+				for j := 1; j < len(posEnds); j++ {
+					if posEnds[j].silDur > posEnds[bestIdx].silDur {
+						bestIdx = j
+					}
 				}
-				sd.prevEnd = 0
-				sd.nextStart = 0
-				sd.tempEnd = 0
+				bestEnd := posEnds[bestIdx].pos
+				rawSegs = append(rawSegs, rawSegment{speechStart, bestEnd})
+				if nextStart < bestEnd {
+					triggered = false
+				} else {
+					speechStart = nextStart
+				}
+			} else if prevEnd > 0 {
+				rawSegs = append(rawSegs, rawSegment{speechStart, prevEnd})
+				if nextStart < prevEnd {
+					triggered = false
+				} else {
+					speechStart = nextStart
+				}
 			} else {
-				endAt := sd.sampleToMs(sd.currSample)
-				startAt := sd.sampleToMs(sd.speechStart - speechPadSamples)
-				slog.Debug("speech end (max duration, force cut)",
-					slog.Int("startAtMs", startAt), slog.Int("endAtMs", endAt))
-				segments = append(segments, Segment{
-					SpeechStartAt: startAt,
-					SpeechEndAt:   endAt,
-				})
-
-				sd.prevEnd = 0
-				sd.nextStart = 0
-				sd.tempEnd = 0
-				sd.triggered = false
+				rawSegs = append(rawSegs, rawSegment{speechStart, curSample})
+				triggered = false
 			}
+			prevEnd = 0
+			nextStart = 0
+			tempEnd = 0
+			posEnds = nil
 			continue
 		}
 
-		if speechProb >= (sd.cfg.Threshold - 0.15) {
+		if prob < negThreshold && triggered {
+			if tempEnd == 0 {
+				tempEnd = curSample
+			}
+			silDurNow := curSample - tempEnd
+			if silDurNow < minSilenceSamples {
+				continue
+			}
+			rawSegs = append(rawSegs, rawSegment{speechStart, tempEnd})
+			prevEnd = 0
+			nextStart = 0
+			tempEnd = 0
+			triggered = false
+			posEnds = nil
 			continue
-		}
-
-		if sd.triggered {
-			if sd.tempEnd == 0 {
-				sd.tempEnd = sd.currSample
-			}
-
-			if sd.currSample-sd.tempEnd > minSilenceSamplesAtMaxSpeech {
-				sd.prevEnd = sd.tempEnd
-			}
-
-			if sd.currSample-sd.tempEnd >= minSilenceSamples {
-				speechEnd := sd.tempEnd
-				speechDuration := speechEnd - sd.speechStart
-
-				if speechDuration > minSpeechSamples {
-					endAt := sd.sampleToMs(speechEnd + speechPadSamples)
-					startAt := sd.sampleToMs(sd.speechStart - speechPadSamples)
-					slog.Debug("speech end",
-						slog.Int("startAtMs", startAt), slog.Int("endAtMs", endAt))
-					segments = append(segments, Segment{
-						SpeechStartAt: startAt,
-						SpeechEndAt:   endAt,
-					})
-				} else {
-					slog.Debug("speech segment discarded (too short)",
-						slog.Int("durationSamples", speechDuration),
-						slog.Int("minSpeechSamples", minSpeechSamples))
-				}
-
-				sd.prevEnd = 0
-				sd.nextStart = 0
-				sd.tempEnd = 0
-				sd.triggered = false
-			}
 		}
 	}
 
-	if sd.triggered {
-		speechDuration := len(pcm) - sd.speechStart
-		if speechDuration > minSpeechSamples {
-			startAt := sd.sampleToMs(sd.speechStart - speechPadSamples)
-			endAt := sd.sampleToMs(len(pcm))
-			slog.Debug("speech end (end of audio)",
-				slog.Int("startAtMs", startAt), slog.Int("endAtMs", endAt))
-			segments = append(segments, Segment{
-				SpeechStartAt: startAt,
-				SpeechEndAt:   endAt,
-			})
-		}
+	if triggered && (audioLenSamples-speechStart) > minSpeechSamples {
+		rawSegs = append(rawSegs, rawSegment{speechStart, audioLenSamples})
+	}
 
-		sd.prevEnd = 0
-		sd.nextStart = 0
-		sd.tempEnd = 0
-		sd.triggered = false
+	// Phase 3: Filter by min speech duration.
+	var filtered []rawSegment
+	for _, seg := range rawSegs {
+		if seg.end-seg.start > minSpeechSamples {
+			filtered = append(filtered, seg)
+		}
+	}
+
+	if len(filtered) == 0 {
+		slog.Debug("speech detection done", slog.Int("segmentsLen", 0))
+		return nil, nil
+	}
+
+	// Phase 4: Apply padding with overlap resolution (matches Python post-processing).
+	for i := range filtered {
+		if i == 0 {
+			filtered[i].start = max(0, filtered[i].start-speechPadSamples)
+		}
+		if i < len(filtered)-1 {
+			silBetween := filtered[i+1].start - filtered[i].end
+			if silBetween < 2*speechPadSamples {
+				filtered[i].end += silBetween / 2
+				filtered[i+1].start = max(0, filtered[i+1].start-silBetween/2)
+			} else {
+				filtered[i].end = min(audioLenSamples, filtered[i].end+speechPadSamples)
+				filtered[i+1].start = max(0, filtered[i+1].start-speechPadSamples)
+			}
+		} else {
+			filtered[i].end = min(audioLenSamples, filtered[i].end+speechPadSamples)
+		}
+	}
+
+	segments := make([]Segment, len(filtered))
+	for i, seg := range filtered {
+		segments[i] = Segment{
+			SpeechStartAt: sd.sampleToMs(seg.start),
+			SpeechEndAt:   sd.sampleToMs(seg.end),
+		}
 	}
 
 	slog.Debug("speech detection done", slog.Int("segmentsLen", len(segments)))
-
 	return segments, nil
 }
 
@@ -495,6 +541,7 @@ func (sd *Detector) Reset() error {
 	sd.speechStart = 0
 	sd.prevEnd = 0
 	sd.nextStart = 0
+	sd.possibleEnds = nil
 	sd.residual = nil
 	for i := 0; i < stateV5Len; i++ {
 		sd.stateV5[i] = 0
@@ -503,7 +550,7 @@ func (sd *Detector) Reset() error {
 		sd.stateH[i] = 0
 		sd.stateC[i] = 0
 	}
-	for i := 0; i < contextLen; i++ {
+	for i := 0; i < maxContextLen; i++ {
 		sd.ctx[i] = 0
 	}
 

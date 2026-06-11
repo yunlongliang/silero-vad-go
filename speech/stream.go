@@ -63,6 +63,11 @@ func (sd *Detector) ProcessChunk(pcm []float32) ([]SpeechEvent, error) {
 	minSpeechSamples := sd.cfg.MinSpeechDurationMs * srPerMs
 	minSilenceSamplesAtMaxSpeech := 98 * srPerMs
 
+	negThreshold := sd.cfg.Threshold - 0.15
+	if negThreshold < 0.01 {
+		negThreshold = 0.01
+	}
+
 	maxSpeechSamples := math.Inf(1)
 	if sd.cfg.MaxSpeechDurationS > 0 {
 		maxSpeechSamples = float64(sd.cfg.SampleRate)*sd.cfg.MaxSpeechDurationS -
@@ -79,36 +84,65 @@ func (sd *Detector) ProcessChunk(pcm []float32) ([]SpeechEvent, error) {
 		}
 
 		sd.currSample += windowSize
+		curSample := sd.currSample - windowSize
 
-		if speechProb >= sd.cfg.Threshold {
-			if sd.tempEnd != 0 {
-				sd.tempEnd = 0
-				if sd.nextStart < sd.prevEnd {
-					sd.nextStart = sd.currSample - windowSize
-				}
+		// Speech resumes after temp_end: record possible split point
+		if speechProb >= sd.cfg.Threshold && sd.tempEnd != 0 {
+			silDur := curSample - sd.tempEnd
+			if silDur > minSilenceSamplesAtMaxSpeech {
+				sd.possibleEnds = append(sd.possibleEnds, possibleEnd{sd.tempEnd, silDur})
 			}
-			if !sd.triggered {
-				sd.triggered = true
-				sd.speechStart = sd.currSample - windowSize
-				startAt := sd.sampleToMs(sd.speechStart - speechPadSamples)
-				slog.Debug("stream: speech start", slog.Int("startAtMs", startAt))
-				events = append(events, SpeechEvent{
-					Type:    EventSpeechStart,
-					Segment: Segment{SpeechStartAt: startAt},
-				})
+			sd.tempEnd = 0
+			if sd.nextStart < sd.prevEnd {
+				sd.nextStart = curSample
 			}
+		}
+
+		// Speech start (only new speech triggers continue)
+		if speechProb >= sd.cfg.Threshold && !sd.triggered {
+			sd.triggered = true
+			sd.speechStart = curSample
+			startAt := sd.sampleToMs(sd.speechStart - speechPadSamples)
+			slog.Debug("stream: speech start", slog.Int("startAtMs", startAt))
+			events = append(events, SpeechEvent{
+				Type:    EventSpeechStart,
+				Segment: Segment{SpeechStartAt: startAt},
+			})
 			continue
 		}
 
-		if sd.triggered && float64(sd.currSample-sd.speechStart) > maxSpeechSamples {
-			if sd.prevEnd > 0 {
+		// Max duration check (runs even when prob >= threshold for already-triggered speech)
+		if sd.triggered && float64(curSample-sd.speechStart) > maxSpeechSamples {
+			if len(sd.possibleEnds) > 0 {
+				bestIdx := 0
+				for j := 1; j < len(sd.possibleEnds); j++ {
+					if sd.possibleEnds[j].silDur > sd.possibleEnds[bestIdx].silDur {
+						bestIdx = j
+					}
+				}
+				bestEnd := sd.possibleEnds[bestIdx].pos
+				endAt := sd.sampleToMs(bestEnd + speechPadSamples)
+				startAt := sd.sampleToMs(sd.speechStart - speechPadSamples)
+				events = append(events, SpeechEvent{
+					Type:    EventSpeechEnd,
+					Segment: Segment{SpeechStartAt: startAt, SpeechEndAt: endAt},
+				})
+				if sd.nextStart < bestEnd {
+					sd.triggered = false
+				} else {
+					sd.speechStart = sd.nextStart
+					events = append(events, SpeechEvent{
+						Type:    EventSpeechStart,
+						Segment: Segment{SpeechStartAt: sd.sampleToMs(sd.speechStart - speechPadSamples)},
+					})
+				}
+			} else if sd.prevEnd > 0 {
 				endAt := sd.sampleToMs(sd.prevEnd + speechPadSamples)
 				startAt := sd.sampleToMs(sd.speechStart - speechPadSamples)
 				events = append(events, SpeechEvent{
 					Type:    EventSpeechEnd,
 					Segment: Segment{SpeechStartAt: startAt, SpeechEndAt: endAt},
 				})
-
 				if sd.nextStart < sd.prevEnd {
 					sd.triggered = false
 				} else {
@@ -118,9 +152,6 @@ func (sd *Detector) ProcessChunk(pcm []float32) ([]SpeechEvent, error) {
 						Segment: Segment{SpeechStartAt: sd.sampleToMs(sd.speechStart - speechPadSamples)},
 					})
 				}
-				sd.prevEnd = 0
-				sd.nextStart = 0
-				sd.tempEnd = 0
 			} else {
 				endAt := sd.sampleToMs(sd.currSample)
 				startAt := sd.sampleToMs(sd.speechStart - speechPadSamples)
@@ -128,21 +159,24 @@ func (sd *Detector) ProcessChunk(pcm []float32) ([]SpeechEvent, error) {
 					Type:    EventSpeechEnd,
 					Segment: Segment{SpeechStartAt: startAt, SpeechEndAt: endAt},
 				})
-				sd.prevEnd = 0
-				sd.nextStart = 0
-				sd.tempEnd = 0
 				sd.triggered = false
 			}
+			sd.prevEnd = 0
+			sd.nextStart = 0
+			sd.tempEnd = 0
+			sd.possibleEnds = nil
 			continue
 		}
 
-		if speechProb >= (sd.cfg.Threshold - 0.15) {
+		// Hysteresis zone
+		if speechProb >= negThreshold {
 			continue
 		}
 
+		// Silence handling
 		if sd.triggered {
 			if sd.tempEnd == 0 {
-				sd.tempEnd = sd.currSample
+				sd.tempEnd = curSample
 			}
 
 			if sd.currSample-sd.tempEnd > minSilenceSamplesAtMaxSpeech {
@@ -168,6 +202,7 @@ func (sd *Detector) ProcessChunk(pcm []float32) ([]SpeechEvent, error) {
 				sd.nextStart = 0
 				sd.tempEnd = 0
 				sd.triggered = false
+				sd.possibleEnds = nil
 			}
 		}
 	}
@@ -210,6 +245,7 @@ func (sd *Detector) Flush() ([]SpeechEvent, error) {
 		sd.tempEnd = 0
 		sd.prevEnd = 0
 		sd.nextStart = 0
+		sd.possibleEnds = nil
 	}
 
 	sd.residual = nil

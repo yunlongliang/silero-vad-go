@@ -15,12 +15,12 @@ import (
 func (sd *Detector) infer(samples []float32) (float32, error) {
 	pcm := samples
 
-	// v3/sherpa model uses LSTM state for temporal context; v5 prepends explicit context samples
+	// v5 model: always prepend context samples (zero-initialized on first call).
+	// Context size is 64 for 16kHz, 32 for 8kHz.
 	if !sd.separateHC {
-		if sd.currSample > 0 {
-			pcm = append(sd.ctx[:], samples...)
-		}
-		copy(sd.ctx[:], samples[len(samples)-contextLen:])
+		ctxSize := sd.contextSize()
+		pcm = append(sd.ctx[:ctxSize:ctxSize], samples...)
+		copy(sd.ctx[:], samples[len(samples)-ctxSize:])
 	}
 
 	var pcmValue *C.OrtValue
