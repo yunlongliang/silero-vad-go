@@ -24,6 +24,9 @@ type DetectOptions struct {
 	SpeechPadMs          int
 	MinSpeechDurationMs  int
 	MaxSpeechDurationS   float64
+	NegThreshold         float32
+	LookbackMs           int
+	LookaheadMs          int
 }
 
 func (o DetectOptions) validate() error {
@@ -91,6 +94,9 @@ func (p *DetectorPool) applyOpts(sd *Detector, opts DetectOptions) {
 	sd.cfg.SpeechPadMs = opts.SpeechPadMs
 	sd.cfg.MinSpeechDurationMs = opts.MinSpeechDurationMs
 	sd.cfg.MaxSpeechDurationS = opts.MaxSpeechDurationS
+	sd.cfg.NegThreshold = opts.NegThreshold
+	sd.cfg.LookbackMs = opts.LookbackMs
+	sd.cfg.LookaheadMs = opts.LookaheadMs
 }
 
 // Detect borrows a detector from the pool, applies the given options,
@@ -112,6 +118,26 @@ func (p *DetectorPool) Detect(pcm []float32, opts DetectOptions) ([]Segment, err
 
 	p.applyOpts(sd, opts)
 	return sd.Detect(pcm)
+}
+
+// DetectWithProbs borrows a detector from the pool, runs detection with full
+// probability output, resets and returns the detector to the pool.
+func (p *DetectorPool) DetectWithProbs(pcm []float32, opts DetectOptions) (DetectResult, error) {
+	if err := opts.validate(); err != nil {
+		return DetectResult{}, fmt.Errorf("invalid options: %w", err)
+	}
+	if p.closed.Load() {
+		return DetectResult{}, fmt.Errorf("pool is destroyed")
+	}
+
+	sd := <-p.pool
+	defer func() {
+		_ = sd.Reset()
+		p.pool <- sd
+	}()
+
+	p.applyOpts(sd, opts)
+	return sd.DetectWithProbs(pcm)
 }
 
 // Acquire borrows a detector from the pool for streaming use.

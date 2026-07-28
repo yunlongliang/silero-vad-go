@@ -18,11 +18,102 @@ const (
 
 // SpeechEvent represents a speech detection event during streaming.
 //
-// For EventSpeechStart: only Segment.SpeechStartAt is populated.
-// For EventSpeechEnd:   both SpeechStartAt and SpeechEndAt are populated.
+// For EventSpeechStart: only Segment.SpeechStartAt is populated, Prob is the triggering probability.
+// For EventSpeechEnd:   both SpeechStartAt and SpeechEndAt are populated, FrameProbs and Samples are filled.
 type SpeechEvent struct {
-	Type    EventType
-	Segment Segment
+	Type       EventType
+	Segment    Segment
+	Prob       float32
+	FrameProbs []float32
+	Samples    []float32
+}
+
+// circularBuffer is an internal ring buffer for audio sample retention.
+type circularBuffer struct {
+	data []float32
+	head int // logical index of the oldest sample
+	size int
+	cap  int
+}
+
+func newCircularBuffer(capacity int) *circularBuffer {
+	return &circularBuffer{
+		data: make([]float32, capacity),
+		cap:  capacity,
+	}
+}
+
+func (b *circularBuffer) Push(samples []float32) {
+	for _, s := range samples {
+		idx := (b.head + b.size) % b.cap
+		if b.size == b.cap {
+			b.data[idx] = s
+			b.head = (b.head + 1) % b.cap
+		} else {
+			b.data[idx] = s
+			b.size++
+		}
+	}
+}
+
+func (b *circularBuffer) Get(logicalStart, length int) []float32 {
+	offset := logicalStart - b.Head()
+	if offset < 0 {
+		length += offset
+		offset = 0
+	}
+	if offset >= b.size || length <= 0 {
+		return nil
+	}
+	if offset+length > b.size {
+		length = b.size - offset
+	}
+	out := make([]float32, length)
+	start := (b.head + offset) % b.cap
+	for i := 0; i < length; i++ {
+		out[i] = b.data[(start+i)%b.cap]
+	}
+	return out
+}
+
+func (b *circularBuffer) Head() int {
+	return b.head
+}
+
+func (b *circularBuffer) Tail() int {
+	return b.head + b.size
+}
+
+func (b *circularBuffer) Size() int {
+	return b.size
+}
+
+func (b *circularBuffer) Pop(n int) {
+	if n > b.size {
+		n = b.size
+	}
+	b.head = (b.head + n) % b.cap
+	b.size -= n
+}
+
+// streamState holds additional state for enhanced streaming detection.
+type streamState struct {
+	buffer     *circularBuffer
+	frameProbs []float32 // probs collected since speech start
+	tempStart  int       // first above-threshold sample for min_speech pre-validation
+	confirmed  bool      // true after min_speech pre-validation passes
+	// logical sample counter for buffer indexing (total samples pushed)
+	totalPushed int
+}
+
+// initStreamState initializes streaming state if not already done.
+func (sd *Detector) initStreamState() {
+	if sd.stream == nil {
+		bufCap := sd.cfg.SampleRate * 120 // 120 seconds of audio buffer
+		sd.stream = &streamState{
+			buffer: newCircularBuffer(bufCap),
+		}
+	}
 }
 
 // ProcessChunk feeds a chunk of audio samples to the detector and returns
@@ -36,6 +127,10 @@ func (sd *Detector) ProcessChunk(pcm []float32) ([]SpeechEvent, error) {
 	if sd == nil {
 		return nil, fmt.Errorf("invalid nil detector")
 	}
+
+	sd.initStreamState()
+	sd.stream.buffer.Push(pcm)
+	sd.stream.totalPushed += len(pcm)
 
 	windowSize := 512
 	if sd.cfg.SampleRate == 8000 {
@@ -59,20 +154,22 @@ func (sd *Detector) ProcessChunk(pcm []float32) ([]SpeechEvent, error) {
 
 	srPerMs := sd.cfg.SampleRate / 1000
 	minSilenceSamples := sd.cfg.MinSilenceDurationMs * srPerMs
-	speechPadSamples := sd.cfg.SpeechPadMs * srPerMs
+	lookback := sd.lookbackSamples()
+	lookahead := sd.lookaheadSamples()
 	minSpeechSamples := sd.cfg.MinSpeechDurationMs * srPerMs
 	minSilenceSamplesAtMaxSpeech := 98 * srPerMs
-
-	negThreshold := sd.cfg.Threshold - 0.15
-	if negThreshold < 0.01 {
-		negThreshold = 0.01
-	}
+	negThreshold := sd.negThresholdValue()
 
 	maxSpeechSamples := math.Inf(1)
 	if sd.cfg.MaxSpeechDurationS > 0 {
 		maxSpeechSamples = float64(sd.cfg.SampleRate)*sd.cfg.MaxSpeechDurationS -
-			float64(windowSize) - float64(2*speechPadSamples)
+			float64(windowSize) - float64(lookback+lookahead)
 	}
+
+	// Dynamic threshold parameters for max_speech approach
+	dynamicThreshold := float32(0.90)
+	dynamicMinSilenceMs := 100
+	dynamicTriggerRatio := 0.9
 
 	var events []SpeechEvent
 	i := 0
@@ -86,8 +183,21 @@ func (sd *Detector) ProcessChunk(pcm []float32) ([]SpeechEvent, error) {
 		sd.currSample += windowSize
 		curSample := sd.currSample - windowSize
 
+		// Dynamic threshold: when speech approaches max duration, tighten params
+		effectiveThreshold := sd.cfg.Threshold
+		effectiveNegThreshold := negThreshold
+		effectiveMinSilence := minSilenceSamples
+		if sd.triggered && sd.stream.confirmed && sd.cfg.MaxSpeechDurationS > 0 {
+			speechDur := float64(curSample - sd.speechStart)
+			if speechDur > maxSpeechSamples*dynamicTriggerRatio {
+				effectiveThreshold = dynamicThreshold
+				effectiveNegThreshold = dynamicThreshold - 0.15
+				effectiveMinSilence = dynamicMinSilenceMs * srPerMs
+			}
+		}
+
 		// Speech resumes after temp_end: record possible split point
-		if speechProb >= sd.cfg.Threshold && sd.tempEnd != 0 {
+		if speechProb >= effectiveThreshold && sd.tempEnd != 0 {
 			silDur := curSample - sd.tempEnd
 			if silDur > minSilenceSamplesAtMaxSpeech {
 				sd.possibleEnds = append(sd.possibleEnds, possibleEnd{sd.tempEnd, silDur})
@@ -98,78 +208,53 @@ func (sd *Detector) ProcessChunk(pcm []float32) ([]SpeechEvent, error) {
 			}
 		}
 
-		// Speech start (only new speech triggers continue)
-		if speechProb >= sd.cfg.Threshold && !sd.triggered {
-			sd.triggered = true
-			sd.speechStart = curSample
-			startAt := sd.sampleToMs(sd.speechStart - speechPadSamples)
-			slog.Debug("stream: speech start", slog.Int("startAtMs", startAt))
-			events = append(events, SpeechEvent{
-				Type:    EventSpeechStart,
-				Segment: Segment{SpeechStartAt: startAt},
-			})
+		// min_speech pre-validation: track potential start
+		if speechProb >= effectiveThreshold && !sd.triggered {
+			if sd.stream.tempStart == 0 {
+				sd.stream.tempStart = curSample
+			}
+			// Check if consecutive speech exceeds min_speech_duration
+			if curSample-sd.stream.tempStart+windowSize >= minSpeechSamples {
+				sd.triggered = true
+				sd.stream.confirmed = true
+				sd.speechStart = sd.stream.tempStart
+				sd.stream.tempStart = 0
+				sd.stream.frameProbs = nil // reset for new segment
+
+				startAt := sd.sampleToMs(sd.speechStart - lookback)
+				slog.Debug("stream: speech start (confirmed)", slog.Int("startAtMs", startAt))
+				events = append(events, SpeechEvent{
+					Type:    EventSpeechStart,
+					Segment: Segment{SpeechStartAt: startAt},
+					Prob:    speechProb,
+				})
+			}
+			if sd.triggered {
+				sd.stream.frameProbs = append(sd.stream.frameProbs, speechProb)
+			}
 			continue
 		}
 
-		// Max duration check (runs even when prob >= threshold for already-triggered speech)
+		// Reset tempStart if below threshold and not yet triggered
+		if speechProb < effectiveThreshold && !sd.triggered {
+			sd.stream.tempStart = 0
+			continue
+		}
+
+		// Collect frame probs while triggered
+		if sd.triggered {
+			sd.stream.frameProbs = append(sd.stream.frameProbs, speechProb)
+		}
+
+		// Max duration check
 		if sd.triggered && float64(curSample-sd.speechStart) > maxSpeechSamples {
-			if len(sd.possibleEnds) > 0 {
-				bestIdx := 0
-				for j := 1; j < len(sd.possibleEnds); j++ {
-					if sd.possibleEnds[j].silDur > sd.possibleEnds[bestIdx].silDur {
-						bestIdx = j
-					}
-				}
-				bestEnd := sd.possibleEnds[bestIdx].pos
-				endAt := sd.sampleToMs(bestEnd + speechPadSamples)
-				startAt := sd.sampleToMs(sd.speechStart - speechPadSamples)
-				events = append(events, SpeechEvent{
-					Type:    EventSpeechEnd,
-					Segment: Segment{SpeechStartAt: startAt, SpeechEndAt: endAt},
-				})
-				if sd.nextStart < bestEnd {
-					sd.triggered = false
-				} else {
-					sd.speechStart = sd.nextStart
-					events = append(events, SpeechEvent{
-						Type:    EventSpeechStart,
-						Segment: Segment{SpeechStartAt: sd.sampleToMs(sd.speechStart - speechPadSamples)},
-					})
-				}
-			} else if sd.prevEnd > 0 {
-				endAt := sd.sampleToMs(sd.prevEnd + speechPadSamples)
-				startAt := sd.sampleToMs(sd.speechStart - speechPadSamples)
-				events = append(events, SpeechEvent{
-					Type:    EventSpeechEnd,
-					Segment: Segment{SpeechStartAt: startAt, SpeechEndAt: endAt},
-				})
-				if sd.nextStart < sd.prevEnd {
-					sd.triggered = false
-				} else {
-					sd.speechStart = sd.nextStart
-					events = append(events, SpeechEvent{
-						Type:    EventSpeechStart,
-						Segment: Segment{SpeechStartAt: sd.sampleToMs(sd.speechStart - speechPadSamples)},
-					})
-				}
-			} else {
-				endAt := sd.sampleToMs(sd.currSample)
-				startAt := sd.sampleToMs(sd.speechStart - speechPadSamples)
-				events = append(events, SpeechEvent{
-					Type:    EventSpeechEnd,
-					Segment: Segment{SpeechStartAt: startAt, SpeechEndAt: endAt},
-				})
-				sd.triggered = false
-			}
-			sd.prevEnd = 0
-			sd.nextStart = 0
-			sd.tempEnd = 0
-			sd.possibleEnds = nil
+			ev := sd.handleMaxDuration(curSample, lookback, lookahead)
+			events = append(events, ev...)
 			continue
 		}
 
 		// Hysteresis zone
-		if speechProb >= negThreshold {
+		if speechProb >= effectiveNegThreshold {
 			continue
 		}
 
@@ -183,18 +268,22 @@ func (sd *Detector) ProcessChunk(pcm []float32) ([]SpeechEvent, error) {
 				sd.prevEnd = sd.tempEnd
 			}
 
-			if sd.currSample-sd.tempEnd >= minSilenceSamples {
+			if sd.currSample-sd.tempEnd >= effectiveMinSilence {
 				speechEnd := sd.tempEnd
 				speechDuration := speechEnd - sd.speechStart
 
 				if speechDuration > minSpeechSamples {
-					endAt := sd.sampleToMs(speechEnd + speechPadSamples)
-					startAt := sd.sampleToMs(sd.speechStart - speechPadSamples)
+					startAt := sd.sampleToMs(sd.speechStart - lookback)
+					endAt := sd.sampleToMs(speechEnd + lookahead)
 					slog.Debug("stream: speech end",
 						slog.Int("startAtMs", startAt), slog.Int("endAtMs", endAt))
+
+					samples := sd.extractPaddedSamples(sd.speechStart-lookback, speechEnd+lookahead)
 					events = append(events, SpeechEvent{
-						Type:    EventSpeechEnd,
-						Segment: Segment{SpeechStartAt: startAt, SpeechEndAt: endAt},
+						Type:       EventSpeechEnd,
+						Segment:    Segment{SpeechStartAt: startAt, SpeechEndAt: endAt},
+						FrameProbs: append([]float32{}, sd.stream.frameProbs...),
+						Samples:    samples,
 					})
 				}
 
@@ -202,6 +291,8 @@ func (sd *Detector) ProcessChunk(pcm []float32) ([]SpeechEvent, error) {
 				sd.nextStart = 0
 				sd.tempEnd = 0
 				sd.triggered = false
+				sd.stream.confirmed = false
+				sd.stream.frameProbs = nil
 				sd.possibleEnds = nil
 			}
 		}
@@ -214,6 +305,118 @@ func (sd *Detector) ProcessChunk(pcm []float32) ([]SpeechEvent, error) {
 	return events, nil
 }
 
+// handleMaxDuration handles the case when speech exceeds max duration.
+func (sd *Detector) handleMaxDuration(curSample, lookback, lookahead int) []SpeechEvent {
+	var events []SpeechEvent
+
+	if len(sd.possibleEnds) > 0 {
+		bestIdx := 0
+		for j := 1; j < len(sd.possibleEnds); j++ {
+			if sd.possibleEnds[j].silDur > sd.possibleEnds[bestIdx].silDur {
+				bestIdx = j
+			}
+		}
+		bestEnd := sd.possibleEnds[bestIdx].pos
+		startAt := sd.sampleToMs(sd.speechStart - lookback)
+		endAt := sd.sampleToMs(bestEnd + lookahead)
+		samples := sd.extractPaddedSamples(sd.speechStart-lookback, bestEnd+lookahead)
+		events = append(events, SpeechEvent{
+			Type:       EventSpeechEnd,
+			Segment:    Segment{SpeechStartAt: startAt, SpeechEndAt: endAt},
+			FrameProbs: append([]float32{}, sd.stream.frameProbs...),
+			Samples:    samples,
+		})
+		if sd.nextStart < bestEnd {
+			sd.triggered = false
+			sd.stream.confirmed = false
+			sd.stream.frameProbs = nil
+		} else {
+			sd.speechStart = sd.nextStart
+			sd.stream.frameProbs = nil
+			events = append(events, SpeechEvent{
+				Type:    EventSpeechStart,
+				Segment: Segment{SpeechStartAt: sd.sampleToMs(sd.speechStart - lookback)},
+			})
+		}
+	} else if sd.prevEnd > 0 {
+		startAt := sd.sampleToMs(sd.speechStart - lookback)
+		endAt := sd.sampleToMs(sd.prevEnd + lookahead)
+		samples := sd.extractPaddedSamples(sd.speechStart-lookback, sd.prevEnd+lookahead)
+		events = append(events, SpeechEvent{
+			Type:       EventSpeechEnd,
+			Segment:    Segment{SpeechStartAt: startAt, SpeechEndAt: endAt},
+			FrameProbs: append([]float32{}, sd.stream.frameProbs...),
+			Samples:    samples,
+		})
+		if sd.nextStart < sd.prevEnd {
+			sd.triggered = false
+			sd.stream.confirmed = false
+			sd.stream.frameProbs = nil
+		} else {
+			sd.speechStart = sd.nextStart
+			sd.stream.frameProbs = nil
+			events = append(events, SpeechEvent{
+				Type:    EventSpeechStart,
+				Segment: Segment{SpeechStartAt: sd.sampleToMs(sd.speechStart - lookback)},
+			})
+		}
+	} else {
+		startAt := sd.sampleToMs(sd.speechStart - lookback)
+		endAt := sd.sampleToMs(sd.currSample)
+		samples := sd.extractPaddedSamples(sd.speechStart-lookback, sd.currSample)
+		events = append(events, SpeechEvent{
+			Type:       EventSpeechEnd,
+			Segment:    Segment{SpeechStartAt: startAt, SpeechEndAt: endAt},
+			FrameProbs: append([]float32{}, sd.stream.frameProbs...),
+			Samples:    samples,
+		})
+		sd.triggered = false
+		sd.stream.confirmed = false
+		sd.stream.frameProbs = nil
+	}
+
+	sd.prevEnd = 0
+	sd.nextStart = 0
+	sd.tempEnd = 0
+	sd.possibleEnds = nil
+	return events
+}
+
+// extractPaddedSamples retrieves audio from the circular buffer by sample position.
+func (sd *Detector) extractPaddedSamples(startSample, endSample int) []float32 {
+	if sd.stream == nil || sd.stream.buffer == nil {
+		return nil
+	}
+	if startSample < 0 {
+		startSample = 0
+	}
+	length := endSample - startSample
+	if length <= 0 {
+		return nil
+	}
+
+	// The buffer uses relative indexing: totalPushed - buffer.Size() is the logical head
+	bufferHead := sd.stream.totalPushed - sd.stream.buffer.Size()
+	relStart := startSample - bufferHead
+	if relStart < 0 {
+		length += relStart
+		relStart = 0
+	}
+	if relStart >= sd.stream.buffer.Size() || length <= 0 {
+		return nil
+	}
+	if relStart+length > sd.stream.buffer.Size() {
+		length = sd.stream.buffer.Size() - relStart
+	}
+
+	out := make([]float32, length)
+	bufStart := (sd.stream.buffer.head + relStart) % sd.stream.buffer.cap
+	for i := 0; i < length; i++ {
+		out[i] = sd.stream.buffer.data[(bufStart+i)%sd.stream.buffer.cap]
+	}
+	return out
+}
+
 // Flush finalises the current stream. If speech is still in progress at the
 // end of the audio, it emits a final SpeechEnd event. Call Reset after Flush
 // before starting a new stream.
@@ -222,22 +425,28 @@ func (sd *Detector) Flush() ([]SpeechEvent, error) {
 		return nil, fmt.Errorf("invalid nil detector")
 	}
 
+	sd.initStreamState()
+
 	var events []SpeechEvent
 
 	if sd.triggered {
 		srPerMs := sd.cfg.SampleRate / 1000
-		speechPadSamples := sd.cfg.SpeechPadMs * srPerMs
+		lookback := sd.lookbackSamples()
 		minSpeechSamples := sd.cfg.MinSpeechDurationMs * srPerMs
 
 		speechDuration := sd.currSample - sd.speechStart
 		if speechDuration > minSpeechSamples {
-			startAt := sd.sampleToMs(sd.speechStart - speechPadSamples)
+			startAt := sd.sampleToMs(sd.speechStart - lookback)
 			endAt := sd.sampleToMs(sd.currSample)
 			slog.Debug("stream: speech end (flush)",
 				slog.Int("startAtMs", startAt), slog.Int("endAtMs", endAt))
+
+			samples := sd.extractPaddedSamples(sd.speechStart-lookback, sd.currSample)
 			events = append(events, SpeechEvent{
-				Type:    EventSpeechEnd,
-				Segment: Segment{SpeechStartAt: startAt, SpeechEndAt: endAt},
+				Type:       EventSpeechEnd,
+				Segment:    Segment{SpeechStartAt: startAt, SpeechEndAt: endAt},
+				FrameProbs: append([]float32{}, sd.stream.frameProbs...),
+				Samples:    samples,
 			})
 		}
 
@@ -246,6 +455,8 @@ func (sd *Detector) Flush() ([]SpeechEvent, error) {
 		sd.prevEnd = 0
 		sd.nextStart = 0
 		sd.possibleEnds = nil
+		sd.stream.confirmed = false
+		sd.stream.frameProbs = nil
 	}
 
 	sd.residual = nil

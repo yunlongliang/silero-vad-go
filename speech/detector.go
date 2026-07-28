@@ -71,6 +71,23 @@ type DetectorConfig struct {
 	MaxSpeechDurationS float64
 	// The log level for the ONNX Runtime environment. Default is LogLevelWarn.
 	LogLevel LogLevel
+	// NegThreshold is the probability below which we consider silence when
+	// speech has been triggered. If <= 0, defaults to Threshold - 0.15.
+	NegThreshold float32
+	// LookbackMs is the padding (ms) to prepend before the speech start boundary.
+	// If > 0, overrides SpeechPadMs for the start side.
+	LookbackMs int
+	// LookaheadMs is the padding (ms) to append after the speech end boundary.
+	// If > 0, overrides SpeechPadMs for the end side.
+	LookaheadMs int
+}
+
+// DetectResult contains the full detection output including per-frame probabilities.
+type DetectResult struct {
+	Segments   []Segment
+	FrameProbs []float32
+	WindowSize int
+	SampleRate int
 }
 
 func (c DetectorConfig) IsValid() error {
@@ -139,6 +156,9 @@ type Detector struct {
 	possibleEnds []possibleEnd
 
 	residual []float32
+
+	// stream holds streaming-specific state (circular buffer, frame probs, etc.)
+	stream *streamState
 }
 
 // Segment contains timing information of a speech segment in milliseconds.
@@ -367,10 +387,7 @@ func (sd *Detector) Detect(pcm []float32) ([]Segment, error) {
 	minSilenceSamplesAtMaxSpeech := 98 * srPerMs
 	audioLenSamples := len(pcm)
 
-	negThreshold := sd.cfg.Threshold - 0.15
-	if negThreshold < 0.01 {
-		negThreshold = 0.01
-	}
+	negThreshold := sd.negThresholdValue()
 
 	maxSpeechSamples := math.Inf(1)
 	if sd.cfg.MaxSpeechDurationS > 0 {
@@ -529,6 +546,222 @@ func (sd *Detector) Detect(pcm []float32) ([]Segment, error) {
 	return segments, nil
 }
 
+// negThresholdValue returns the effective negative threshold.
+func (sd *Detector) negThresholdValue() float32 {
+	if sd.cfg.NegThreshold > 0 {
+		return sd.cfg.NegThreshold
+	}
+	v := sd.cfg.Threshold - 0.15
+	if v < 0.01 {
+		v = 0.01
+	}
+	return v
+}
+
+// lookbackSamples returns the lookback padding in samples.
+func (sd *Detector) lookbackSamples() int {
+	if sd.cfg.LookbackMs > 0 {
+		return sd.cfg.LookbackMs * sd.cfg.SampleRate / 1000
+	}
+	return sd.cfg.SpeechPadMs * sd.cfg.SampleRate / 1000
+}
+
+// lookaheadSamples returns the lookahead padding in samples.
+func (sd *Detector) lookaheadSamples() int {
+	if sd.cfg.LookaheadMs > 0 {
+		return sd.cfg.LookaheadMs * sd.cfg.SampleRate / 1000
+	}
+	return sd.cfg.SpeechPadMs * sd.cfg.SampleRate / 1000
+}
+
+// DetectWithProbs runs speech detection and returns both segments and per-frame probabilities.
+// It also extracts padded audio samples for each segment from the input PCM.
+func (sd *Detector) DetectWithProbs(pcm []float32) (DetectResult, error) {
+	if sd == nil {
+		return DetectResult{}, fmt.Errorf("invalid nil detector")
+	}
+
+	windowSize := 512
+	if sd.cfg.SampleRate == 8000 {
+		windowSize = 256
+	}
+
+	if len(pcm) < windowSize {
+		return DetectResult{}, fmt.Errorf("not enough samples")
+	}
+
+	srPerMs := sd.cfg.SampleRate / 1000
+	minSilenceSamples := sd.cfg.MinSilenceDurationMs * srPerMs
+	lookback := sd.lookbackSamples()
+	lookahead := sd.lookaheadSamples()
+	minSpeechSamples := sd.cfg.MinSpeechDurationMs * srPerMs
+	minSilenceSamplesAtMaxSpeech := 98 * srPerMs
+	audioLenSamples := len(pcm)
+	negThreshold := sd.negThresholdValue()
+
+	maxSpeechSamples := math.Inf(1)
+	if sd.cfg.MaxSpeechDurationS > 0 {
+		maxSpeechSamples = float64(sd.cfg.SampleRate)*sd.cfg.MaxSpeechDurationS -
+			float64(windowSize) - float64(lookback+lookahead)
+	}
+
+	// Phase 1: Collect speech probabilities.
+	var speechProbs []float32
+	for i := 0; i < audioLenSamples; i += windowSize {
+		end := i + windowSize
+		var chunk []float32
+		if end > audioLenSamples {
+			padded := make([]float32, windowSize)
+			copy(padded, pcm[i:])
+			chunk = padded
+		} else {
+			chunk = pcm[i:end]
+		}
+		prob, err := sd.infer(chunk)
+		if err != nil {
+			return DetectResult{}, fmt.Errorf("infer failed: %w", err)
+		}
+		speechProbs = append(speechProbs, prob)
+	}
+
+	// Phase 2: Hysteresis segmentation.
+	type rawSegment struct{ start, end int }
+	var (
+		triggered   bool
+		speechStart int
+		tempEnd     int
+		prevEnd     int
+		nextStart   int
+		posEnds     []possibleEnd
+		rawSegs     []rawSegment
+	)
+
+	for i, prob := range speechProbs {
+		curSample := windowSize * i
+
+		if prob >= sd.cfg.Threshold && tempEnd != 0 {
+			silDur := curSample - tempEnd
+			if silDur > minSilenceSamplesAtMaxSpeech {
+				posEnds = append(posEnds, possibleEnd{tempEnd, silDur})
+			}
+			tempEnd = 0
+			if nextStart < prevEnd {
+				nextStart = curSample
+			}
+		}
+
+		if prob >= sd.cfg.Threshold && !triggered {
+			triggered = true
+			speechStart = curSample
+			continue
+		}
+
+		if triggered && float64(curSample-speechStart) > maxSpeechSamples {
+			if len(posEnds) > 0 {
+				bestIdx := 0
+				for j := 1; j < len(posEnds); j++ {
+					if posEnds[j].silDur > posEnds[bestIdx].silDur {
+						bestIdx = j
+					}
+				}
+				bestEnd := posEnds[bestIdx].pos
+				rawSegs = append(rawSegs, rawSegment{speechStart, bestEnd})
+				if nextStart < bestEnd {
+					triggered = false
+				} else {
+					speechStart = nextStart
+				}
+			} else if prevEnd > 0 {
+				rawSegs = append(rawSegs, rawSegment{speechStart, prevEnd})
+				if nextStart < prevEnd {
+					triggered = false
+				} else {
+					speechStart = nextStart
+				}
+			} else {
+				rawSegs = append(rawSegs, rawSegment{speechStart, curSample})
+				triggered = false
+			}
+			prevEnd = 0
+			nextStart = 0
+			tempEnd = 0
+			posEnds = nil
+			continue
+		}
+
+		if prob < negThreshold && triggered {
+			if tempEnd == 0 {
+				tempEnd = curSample
+			}
+			silDurNow := curSample - tempEnd
+			if silDurNow < minSilenceSamples {
+				continue
+			}
+			rawSegs = append(rawSegs, rawSegment{speechStart, tempEnd})
+			prevEnd = 0
+			nextStart = 0
+			tempEnd = 0
+			triggered = false
+			posEnds = nil
+			continue
+		}
+	}
+
+	if triggered && (audioLenSamples-speechStart) > minSpeechSamples {
+		rawSegs = append(rawSegs, rawSegment{speechStart, audioLenSamples})
+	}
+
+	// Phase 3: Filter by min speech duration.
+	var filtered []rawSegment
+	for _, seg := range rawSegs {
+		if seg.end-seg.start > minSpeechSamples {
+			filtered = append(filtered, seg)
+		}
+	}
+
+	if len(filtered) == 0 {
+		return DetectResult{
+			FrameProbs: speechProbs,
+			WindowSize: windowSize,
+			SampleRate: sd.cfg.SampleRate,
+		}, nil
+	}
+
+	// Phase 4: Apply lookback/lookahead padding with overlap resolution.
+	for i := range filtered {
+		if i == 0 {
+			filtered[i].start = max(0, filtered[i].start-lookback)
+		}
+		if i < len(filtered)-1 {
+			silBetween := filtered[i+1].start - filtered[i].end
+			if silBetween < lookback+lookahead {
+				filtered[i].end += silBetween / 2
+				filtered[i+1].start = max(0, filtered[i+1].start-silBetween/2)
+			} else {
+				filtered[i].end = min(audioLenSamples, filtered[i].end+lookahead)
+				filtered[i+1].start = max(0, filtered[i+1].start-lookback)
+			}
+		} else {
+			filtered[i].end = min(audioLenSamples, filtered[i].end+lookahead)
+		}
+	}
+
+	segments := make([]Segment, len(filtered))
+	for i, seg := range filtered {
+		segments[i] = Segment{
+			SpeechStartAt: sd.sampleToMs(seg.start),
+			SpeechEndAt:   sd.sampleToMs(seg.end),
+		}
+	}
+
+	return DetectResult{
+		Segments:   segments,
+		FrameProbs: speechProbs,
+		WindowSize: windowSize,
+		SampleRate: sd.cfg.SampleRate,
+	}, nil
+}
+
 // Reset clears all internal state so the detector can be reused for a new audio stream.
 func (sd *Detector) Reset() error {
 	if sd == nil {
@@ -543,6 +776,7 @@ func (sd *Detector) Reset() error {
 	sd.nextStart = 0
 	sd.possibleEnds = nil
 	sd.residual = nil
+	sd.stream = nil
 	for i := 0; i < stateV5Len; i++ {
 		sd.stateV5[i] = 0
 	}
