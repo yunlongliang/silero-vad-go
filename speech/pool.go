@@ -27,6 +27,8 @@ type DetectOptions struct {
 	NegThreshold         float32
 	LookbackMs           int
 	LookaheadMs          int
+	LookbackMinProb      float32
+	MaxLookbackMs        int
 }
 
 func (o DetectOptions) validate() error {
@@ -97,6 +99,8 @@ func (p *DetectorPool) applyOpts(sd *Detector, opts DetectOptions) {
 	sd.cfg.NegThreshold = opts.NegThreshold
 	sd.cfg.LookbackMs = opts.LookbackMs
 	sd.cfg.LookaheadMs = opts.LookaheadMs
+	sd.cfg.LookbackMinProb = opts.LookbackMinProb
+	sd.cfg.MaxLookbackMs = opts.MaxLookbackMs
 }
 
 // Detect borrows a detector from the pool, applies the given options,

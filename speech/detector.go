@@ -80,6 +80,13 @@ type DetectorConfig struct {
 	// LookaheadMs is the padding (ms) to append after the speech end boundary.
 	// If > 0, overrides SpeechPadMs for the end side.
 	LookaheadMs int
+	// LookbackMinProb is the minimum probability for adaptive lookback extension.
+	// After fixed padding, frames before the segment start with prob >= this value
+	// will be included. If <= 0, defaults to 0.3.
+	LookbackMinProb float32
+	// MaxLookbackMs caps the adaptive lookback extension in milliseconds.
+	// If <= 0, defaults to 500ms.
+	MaxLookbackMs int
 }
 
 // DetectResult contains the full detection output including per-frame probabilities.
@@ -743,6 +750,39 @@ func (sd *Detector) DetectWithProbs(pcm []float32) (DetectResult, error) {
 			}
 		} else {
 			filtered[i].end = min(audioLenSamples, filtered[i].end+lookahead)
+		}
+	}
+
+	// Phase 5: Adaptive probability-based lookback extension.
+	// For each segment, walk backward from its (already-padded) start.
+	// If consecutive frames have prob >= lookbackMinProb, extend the segment.
+	lookbackMinProb := float32(0.3)
+	if sd.cfg.LookbackMinProb > 0 {
+		lookbackMinProb = sd.cfg.LookbackMinProb
+	}
+	maxExtSamples := 500 * srPerMs
+	if sd.cfg.MaxLookbackMs > 0 {
+		maxExtSamples = sd.cfg.MaxLookbackMs * srPerMs
+	}
+
+	for i := range filtered {
+		startFrame := filtered[i].start / windowSize
+		extendTo := filtered[i].start
+		for f := startFrame - 1; f >= 0; f-- {
+			if speechProbs[f] < lookbackMinProb {
+				break
+			}
+			candidateStart := f * windowSize
+			if filtered[i].start-candidateStart > maxExtSamples {
+				break
+			}
+			extendTo = candidateStart
+		}
+		if i > 0 && extendTo < filtered[i-1].end {
+			extendTo = filtered[i-1].end
+		}
+		if extendTo < filtered[i].start {
+			filtered[i].start = extendTo
 		}
 	}
 
