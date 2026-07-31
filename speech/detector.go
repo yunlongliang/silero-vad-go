@@ -87,6 +87,16 @@ type DetectorConfig struct {
 	// MaxLookbackMs caps the adaptive lookback extension in milliseconds.
 	// If <= 0, defaults to 500ms.
 	MaxLookbackMs int
+	// EnergyFilterEnabled enables the post-detection energy validation filter.
+	// When enabled, segments where fewer than MinEnergyRatio of above-threshold
+	// frames have RMS energy >= MinEnergyDb are discarded.
+	EnergyFilterEnabled bool
+	// MinEnergyDb is the minimum RMS energy (dBFS) for a frame to count as valid.
+	// If 0, defaults to -60.
+	MinEnergyDb float64
+	// MinEnergyRatio is the minimum fraction of above-threshold frames that must
+	// have energy >= MinEnergyDb. If <= 0, defaults to 0.5.
+	MinEnergyRatio float64
 }
 
 // DetectResult contains the full detection output including per-frame probabilities.
@@ -784,6 +794,68 @@ func (sd *Detector) DetectWithProbs(pcm []float32) (DetectResult, error) {
 		if extendTo < filtered[i].start {
 			filtered[i].start = extendTo
 		}
+	}
+
+	// Phase 6: Energy validation filter.
+	// For each segment, count frames where prob >= threshold that also have
+	// RMS energy >= MinEnergyDb. If fewer than MinEnergyRatio of those frames
+	// pass the energy check, the segment is discarded.
+	if sd.cfg.EnergyFilterEnabled {
+		minDb := sd.cfg.MinEnergyDb
+		if minDb == 0 {
+			minDb = -60
+		}
+		minRatio := sd.cfg.MinEnergyRatio
+		if minRatio <= 0 {
+			minRatio = 0.5
+		}
+		threshold := sd.cfg.Threshold
+		if threshold <= 0 {
+			threshold = 0.5
+		}
+
+		var energyFiltered []rawSegment
+		for _, seg := range filtered {
+			startFrame := seg.start / windowSize
+			endFrame := seg.end / windowSize
+			if endFrame > len(speechProbs) {
+				endFrame = len(speechProbs)
+			}
+
+			probCount := 0
+			energyCount := 0
+			for f := startFrame; f < endFrame; f++ {
+				if speechProbs[f] >= threshold {
+					probCount++
+					// Compute RMS dB for this frame
+					frameStart := f * windowSize
+					frameEnd := frameStart + windowSize
+					if frameEnd > len(pcm) {
+						frameEnd = len(pcm)
+					}
+					var sumSq float64
+					n := frameEnd - frameStart
+					if n > 0 {
+						for s := frameStart; s < frameEnd; s++ {
+							sumSq += float64(pcm[s]) * float64(pcm[s])
+						}
+						rms := math.Sqrt(sumSq / float64(n))
+						db := float64(-100)
+						if rms > 0 {
+							db = 20 * math.Log10(rms)
+						}
+						if db >= minDb {
+							energyCount++
+						}
+					}
+				}
+			}
+
+			if probCount == 0 || float64(energyCount)/float64(probCount) >= minRatio {
+				energyFiltered = append(energyFiltered, seg)
+			}
+		}
+		filtered = energyFiltered
 	}
 
 	segments := make([]Segment, len(filtered))

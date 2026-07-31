@@ -29,6 +29,9 @@ type DetectOptions struct {
 	LookaheadMs          int
 	LookbackMinProb      float32
 	MaxLookbackMs        int
+	EnergyFilterEnabled  bool
+	MinEnergyDb          float64
+	MinEnergyRatio       float64
 }
 
 func (o DetectOptions) validate() error {
@@ -101,6 +104,9 @@ func (p *DetectorPool) applyOpts(sd *Detector, opts DetectOptions) {
 	sd.cfg.LookaheadMs = opts.LookaheadMs
 	sd.cfg.LookbackMinProb = opts.LookbackMinProb
 	sd.cfg.MaxLookbackMs = opts.MaxLookbackMs
+	sd.cfg.EnergyFilterEnabled = opts.EnergyFilterEnabled
+	sd.cfg.MinEnergyDb = opts.MinEnergyDb
+	sd.cfg.MinEnergyRatio = opts.MinEnergyRatio
 }
 
 // Detect borrows a detector from the pool, applies the given options,
