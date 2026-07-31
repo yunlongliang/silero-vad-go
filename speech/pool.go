@@ -34,6 +34,7 @@ type DetectOptions struct {
 	MinEnergyRatio       float64
 	StateResetSilenceMs  int
 	StateDecayOnEnd      float32
+	StateResetIntervalMs int
 }
 
 func (o DetectOptions) validate() error {
@@ -111,6 +112,7 @@ func (p *DetectorPool) applyOpts(sd *Detector, opts DetectOptions) {
 	sd.cfg.MinEnergyRatio = opts.MinEnergyRatio
 	sd.cfg.StateResetSilenceMs = opts.StateResetSilenceMs
 	sd.cfg.StateDecayOnEnd = opts.StateDecayOnEnd
+	sd.cfg.StateResetIntervalMs = opts.StateResetIntervalMs
 }
 
 // Detect borrows a detector from the pool, applies the given options,

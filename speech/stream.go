@@ -105,6 +105,7 @@ type streamState struct {
 	// logical sample counter for buffer indexing (total samples pushed)
 	totalPushed       int
 	silenceFrameCount int // consecutive frames below threshold (for state reset)
+	framesSinceReset  int // total frames since last time-based periodic reset
 }
 
 // initStreamState initializes streaming state if not already done.
@@ -181,6 +182,15 @@ func (sd *Detector) ProcessChunk(pcm []float32) ([]SpeechEvent, error) {
 		}
 	}
 
+	// Time-based periodic reset: unconditional reset every N ms
+	stateResetIntervalFrames := 0
+	if sd.cfg.StateResetIntervalMs > 0 {
+		stateResetIntervalFrames = (sd.cfg.StateResetIntervalMs * srPerMs) / windowSize
+		if stateResetIntervalFrames < 1 {
+			stateResetIntervalFrames = 1
+		}
+	}
+
 	var events []SpeechEvent
 	i := 0
 
@@ -192,6 +202,15 @@ func (sd *Detector) ProcessChunk(pcm []float32) ([]SpeechEvent, error) {
 
 		sd.currSample += windowSize
 		curSample := sd.currSample - windowSize
+
+		// Time-based periodic reset: reset when interval elapsed and not in speech
+		sd.stream.framesSinceReset++
+		if stateResetIntervalFrames > 0 && sd.stream.framesSinceReset >= stateResetIntervalFrames {
+			if !sd.triggered {
+				sd.resetRNNState()
+				sd.stream.framesSinceReset = 0
+			}
+		}
 
 		// Dynamic threshold: when speech approaches max duration, tighten params
 		effectiveThreshold := sd.cfg.Threshold
@@ -628,6 +647,15 @@ func (sd *Detector) ProcessChunkWithProbs(pcm []float32) ([]SpeechEvent, []Frame
 		}
 	}
 
+	// Time-based periodic reset: unconditional reset every N ms
+	stateResetIntervalFrames := 0
+	if sd.cfg.StateResetIntervalMs > 0 {
+		stateResetIntervalFrames = (sd.cfg.StateResetIntervalMs * srPerMs) / windowSize
+		if stateResetIntervalFrames < 1 {
+			stateResetIntervalFrames = 1
+		}
+	}
+
 	var events []SpeechEvent
 	var frameProbs []FrameProb
 	i := 0
@@ -640,6 +668,15 @@ func (sd *Detector) ProcessChunkWithProbs(pcm []float32) ([]SpeechEvent, []Frame
 
 		sd.currSample += windowSize
 		curSample := sd.currSample - windowSize
+
+		// Time-based periodic reset: reset when interval elapsed and not in speech
+		sd.stream.framesSinceReset++
+		if stateResetIntervalFrames > 0 && sd.stream.framesSinceReset >= stateResetIntervalFrames {
+			if !sd.triggered {
+				sd.resetRNNState()
+				sd.stream.framesSinceReset = 0
+			}
+		}
 
 		frameProbs = append(frameProbs, FrameProb{
 			TimeMs: sd.sampleToMs(curSample),

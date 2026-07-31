@@ -105,6 +105,10 @@ type DetectorConfig struct {
 	// speech-end event. Reduces accumulated bias while preserving some context.
 	// 1.0 = no decay (default), 0.0 = full reset. Recommended: 0.3-0.5.
 	StateDecayOnEnd float32
+	// StateResetIntervalMs is the maximum time (ms) between unconditional
+	// RNN state resets, regardless of speech/silence. Prevents state
+	// accumulation in long audio. 0 disables (default). Recommended: 5000-10000.
+	StateResetIntervalMs int
 }
 
 // DetectResult contains the full detection output including per-frame probabilities.
