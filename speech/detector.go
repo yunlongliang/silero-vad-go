@@ -97,6 +97,14 @@ type DetectorConfig struct {
 	// MinEnergyRatio is the minimum fraction of above-threshold frames that must
 	// have energy >= MinEnergyDb. If <= 0, defaults to 0.5.
 	MinEnergyRatio float64
+	// StateResetSilenceMs is the continuous silence duration (ms) after which
+	// the RNN state is fully reset to avoid state accumulation degrading
+	// detection of short utterances in long audio. 0 disables (default).
+	StateResetSilenceMs int
+	// StateDecayOnEnd is the decay factor applied to the RNN state after each
+	// speech-end event. Reduces accumulated bias while preserving some context.
+	// 1.0 = no decay (default), 0.0 = full reset. Recommended: 0.3-0.5.
+	StateDecayOnEnd float32
 }
 
 // DetectResult contains the full detection output including per-frame probabilities.

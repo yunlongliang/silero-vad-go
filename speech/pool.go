@@ -32,6 +32,8 @@ type DetectOptions struct {
 	EnergyFilterEnabled  bool
 	MinEnergyDb          float64
 	MinEnergyRatio       float64
+	StateResetSilenceMs  int
+	StateDecayOnEnd      float32
 }
 
 func (o DetectOptions) validate() error {
@@ -107,6 +109,8 @@ func (p *DetectorPool) applyOpts(sd *Detector, opts DetectOptions) {
 	sd.cfg.EnergyFilterEnabled = opts.EnergyFilterEnabled
 	sd.cfg.MinEnergyDb = opts.MinEnergyDb
 	sd.cfg.MinEnergyRatio = opts.MinEnergyRatio
+	sd.cfg.StateResetSilenceMs = opts.StateResetSilenceMs
+	sd.cfg.StateDecayOnEnd = opts.StateDecayOnEnd
 }
 
 // Detect borrows a detector from the pool, applies the given options,

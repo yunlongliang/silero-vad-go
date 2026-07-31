@@ -103,7 +103,8 @@ type streamState struct {
 	tempStart  int       // first above-threshold sample for min_speech pre-validation
 	confirmed  bool      // true after min_speech pre-validation passes
 	// logical sample counter for buffer indexing (total samples pushed)
-	totalPushed int
+	totalPushed       int
+	silenceFrameCount int // consecutive frames below threshold (for state reset)
 }
 
 // initStreamState initializes streaming state if not already done.
@@ -171,6 +172,15 @@ func (sd *Detector) ProcessChunk(pcm []float32) ([]SpeechEvent, error) {
 	dynamicMinSilenceMs := 100
 	dynamicTriggerRatio := 0.9
 
+	// State reset: how many consecutive silence frames trigger a full RNN reset
+	stateResetFrames := 0
+	if sd.cfg.StateResetSilenceMs > 0 {
+		stateResetFrames = (sd.cfg.StateResetSilenceMs * srPerMs) / windowSize
+		if stateResetFrames < 1 {
+			stateResetFrames = 1
+		}
+	}
+
 	var events []SpeechEvent
 	i := 0
 
@@ -210,6 +220,7 @@ func (sd *Detector) ProcessChunk(pcm []float32) ([]SpeechEvent, error) {
 
 		// min_speech pre-validation: track potential start
 		if speechProb >= effectiveThreshold && !sd.triggered {
+			sd.stream.silenceFrameCount = 0 // speech detected, reset silence counter
 			if sd.stream.tempStart == 0 {
 				sd.stream.tempStart = curSample
 			}
@@ -238,6 +249,12 @@ func (sd *Detector) ProcessChunk(pcm []float32) ([]SpeechEvent, error) {
 		// Reset tempStart if below threshold and not yet triggered
 		if speechProb < effectiveThreshold && !sd.triggered {
 			sd.stream.tempStart = 0
+			// Track consecutive silence frames for state reset
+			sd.stream.silenceFrameCount++
+			if stateResetFrames > 0 && sd.stream.silenceFrameCount >= stateResetFrames {
+				sd.resetRNNState()
+				sd.stream.silenceFrameCount = 0
+			}
 			continue
 		}
 
@@ -296,6 +313,7 @@ func (sd *Detector) ProcessChunk(pcm []float32) ([]SpeechEvent, error) {
 				sd.stream.confirmed = false
 				sd.stream.frameProbs = nil
 				sd.possibleEnds = nil
+				sd.applyStateDecay()
 			}
 		}
 	}
@@ -404,6 +422,7 @@ func (sd *Detector) handleMaxDuration(curSample, lookback, lookahead int) []Spee
 			sd.triggered = false
 			sd.stream.confirmed = false
 			sd.stream.frameProbs = nil
+			sd.applyStateDecay()
 		} else {
 			sd.speechStart = sd.nextStart
 			sd.stream.frameProbs = nil
@@ -428,6 +447,7 @@ func (sd *Detector) handleMaxDuration(curSample, lookback, lookahead int) []Spee
 			sd.triggered = false
 			sd.stream.confirmed = false
 			sd.stream.frameProbs = nil
+			sd.applyStateDecay()
 		} else {
 			sd.speechStart = sd.nextStart
 			sd.stream.frameProbs = nil
@@ -451,6 +471,7 @@ func (sd *Detector) handleMaxDuration(curSample, lookback, lookahead int) []Spee
 		sd.triggered = false
 		sd.stream.confirmed = false
 		sd.stream.frameProbs = nil
+		sd.applyStateDecay()
 	}
 
 	sd.prevEnd = 0
@@ -599,6 +620,14 @@ func (sd *Detector) ProcessChunkWithProbs(pcm []float32) ([]SpeechEvent, []Frame
 	dynamicMinSilenceMs := 100
 	dynamicTriggerRatio := 0.9
 
+	stateResetFrames := 0
+	if sd.cfg.StateResetSilenceMs > 0 {
+		stateResetFrames = (sd.cfg.StateResetSilenceMs * srPerMs) / windowSize
+		if stateResetFrames < 1 {
+			stateResetFrames = 1
+		}
+	}
+
 	var events []SpeechEvent
 	var frameProbs []FrameProb
 	i := 0
@@ -641,6 +670,7 @@ func (sd *Detector) ProcessChunkWithProbs(pcm []float32) ([]SpeechEvent, []Frame
 		}
 
 		if speechProb >= effectiveThreshold && !sd.triggered {
+			sd.stream.silenceFrameCount = 0
 			if sd.stream.tempStart == 0 {
 				sd.stream.tempStart = curSample
 			}
@@ -666,6 +696,11 @@ func (sd *Detector) ProcessChunkWithProbs(pcm []float32) ([]SpeechEvent, []Frame
 
 		if speechProb < effectiveThreshold && !sd.triggered {
 			sd.stream.tempStart = 0
+			sd.stream.silenceFrameCount++
+			if stateResetFrames > 0 && sd.stream.silenceFrameCount >= stateResetFrames {
+				sd.resetRNNState()
+				sd.stream.silenceFrameCount = 0
+			}
 			continue
 		}
 
@@ -717,6 +752,7 @@ func (sd *Detector) ProcessChunkWithProbs(pcm []float32) ([]SpeechEvent, []Frame
 				sd.possibleEnds = nil
 				sd.stream.confirmed = false
 				sd.stream.frameProbs = nil
+				sd.applyStateDecay()
 			}
 		}
 	}
@@ -726,4 +762,43 @@ func (sd *Detector) ProcessChunkWithProbs(pcm []float32) ([]SpeechEvent, []Frame
 	}
 
 	return events, frameProbs, nil
+}
+
+// resetRNNState fully resets the RNN hidden state and context to zeros.
+func (sd *Detector) resetRNNState() {
+	for i := 0; i < stateV5Len; i++ {
+		sd.stateV5[i] = 0
+	}
+	for i := 0; i < stateV3Len; i++ {
+		sd.stateH[i] = 0
+		sd.stateC[i] = 0
+	}
+	for i := 0; i < maxContextLen; i++ {
+		sd.ctx[i] = 0
+	}
+}
+
+// decayRNNState multiplies all RNN state values by the given factor.
+func (sd *Detector) decayRNNState(factor float32) {
+	if factor <= 0 {
+		sd.resetRNNState()
+		return
+	}
+	if factor >= 1 {
+		return
+	}
+	for i := 0; i < stateV5Len; i++ {
+		sd.stateV5[i] *= factor
+	}
+	for i := 0; i < stateV3Len; i++ {
+		sd.stateH[i] *= factor
+		sd.stateC[i] *= factor
+	}
+}
+
+// applyStateDecay applies the configured StateDecayOnEnd to the RNN state.
+func (sd *Detector) applyStateDecay() {
+	if sd.cfg.StateDecayOnEnd > 0 && sd.cfg.StateDecayOnEnd < 1 {
+		sd.decayRNNState(sd.cfg.StateDecayOnEnd)
+	}
 }
