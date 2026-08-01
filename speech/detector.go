@@ -109,6 +109,12 @@ type DetectorConfig struct {
 	// RNN state resets, regardless of speech/silence. Prevents state
 	// accumulation in long audio. 0 disables (default). Recommended: 5000-10000.
 	StateResetIntervalMs int
+	// IntraOpThreads sets the number of threads for intra-op parallelism in
+	// ONNX Runtime. Default (0 or unset) uses 1 thread for deterministic output.
+	IntraOpThreads int
+	// InterOpThreads sets the number of threads for inter-op parallelism in
+	// ONNX Runtime. Default (0 or unset) uses 1 thread for deterministic output.
+	InterOpThreads int
 }
 
 // DetectResult contains the full detection output including per-frame probabilities.
@@ -299,13 +305,21 @@ func NewDetector(cfg DetectorConfig) (*Detector, error) {
 		return nil, fmt.Errorf("failed to create session options: %s", C.GoString(C.OrtApiGetErrorMessage(sd.api, status)))
 	}
 
-	status = C.OrtApiSetIntraOpNumThreads(sd.api, sd.sessionOpts, 1)
+	intraThreads := cfg.IntraOpThreads
+	if intraThreads <= 0 {
+		intraThreads = 1
+	}
+	status = C.OrtApiSetIntraOpNumThreads(sd.api, sd.sessionOpts, C.int(intraThreads))
 	defer C.OrtApiReleaseStatus(sd.api, status)
 	if status != nil {
 		return nil, fmt.Errorf("failed to set intra threads: %s", C.GoString(C.OrtApiGetErrorMessage(sd.api, status)))
 	}
 
-	status = C.OrtApiSetInterOpNumThreads(sd.api, sd.sessionOpts, 1)
+	interThreads := cfg.InterOpThreads
+	if interThreads <= 0 {
+		interThreads = 1
+	}
+	status = C.OrtApiSetInterOpNumThreads(sd.api, sd.sessionOpts, C.int(interThreads))
 	defer C.OrtApiReleaseStatus(sd.api, status)
 	if status != nil {
 		return nil, fmt.Errorf("failed to set inter threads: %s", C.GoString(C.OrtApiGetErrorMessage(sd.api, status)))
